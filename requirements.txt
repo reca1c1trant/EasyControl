@@ -1,7 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cu124
-torch
-torchvision
-torchaudio==2.3.1
+torch==2.4.0
+torchvision==2.4.0
+torchaudio==2.4.0
 diffusers==0.32.2
 easydict==1.13
 einops==0.8.1
