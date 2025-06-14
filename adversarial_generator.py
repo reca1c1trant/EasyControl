@@ -148,17 +148,9 @@ class OptimizedAdversarialGenerator:
         
         logger.info("EasyControl pipeline initialized successfully!")
     
-    def clear_cache_smart(self):
-        """智能缓存清理 - 只在必要时清理"""
-        total_cache_size = 0
-        for name, attn_processor in self.pipe.transformer.attn_processors.items():
-            if hasattr(attn_processor, 'bank_kv'):
-                total_cache_size += len(attn_processor.bank_kv)
-        
-        if total_cache_size > 1000:  # 阈值可调
-            for name, attn_processor in self.pipe.transformer.attn_processors.items():
-                if hasattr(attn_processor, 'bank_kv'):
-                    attn_processor.bank_kv.clear()
+    def clear_cache(transformer):
+        for name, attn_processor in transformer.attn_processors.items():
+            attn_processor.bank_kv.clear()    
     
     def preprocess_subject_image(self, image: Image.Image, cond_size: int = 512) -> torch.Tensor:
         """
@@ -238,7 +230,7 @@ class OptimizedAdversarialGenerator:
                 ).images[0]
         
         # 智能缓存清理
-        self.clear_cache_smart()
+        self.clear_cache()
         return image
     
     def compute_single_prompt_mse(self, original_img: Image.Image, 
@@ -340,7 +332,6 @@ class OptimizedAdversarialGenerator:
             
             # 清零梯度
             delta.grad = None
-        
         return delta.detach(), attack_info
     
     def process_dataset(self, 
