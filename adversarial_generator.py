@@ -34,7 +34,7 @@ class LAIONFaceDataset(Dataset):
     """
     def __init__(self, data_root: str, subset_size: Optional[int] = None):
         self.data_root = Path(data_root)
-        self.images_dir = self.data_root / "images"
+        self.images_dir = self.data_root
         
         # 如果有metadata文件就读取，否则扫描images目录
         metadata_path = self.data_root / "metadata.json"
@@ -87,8 +87,8 @@ class LAIONFaceDataset(Dataset):
 
 class OptimizedAdversarialGenerator:
     def __init__(self, 
-                 base_path: str = "black-forest-labs/FLUX.1-dev",
-                 subject_lora_path: str = "./checkpoints/models/subject.safetensors",
+                 base_path: str = "/openbayes/input/input0",
+                 subject_lora_path: str = "/openbayes/input/input0/subject.safetensors",
                  device: str = "cuda",
                  output_dir: str = "./adversarial_results"):
         """
@@ -119,15 +119,209 @@ class OptimizedAdversarialGenerator:
         self.attack_prompt = "A SKS on the beach"
         
         logger.info(f"Using attack prompt: '{self.attack_prompt}'")
+    def investigate_pipeline_processor(self):
+        """
+        调查你的pipeline image processor到底做了什么
+        """
+        print("=" * 60)
+        print("INVESTIGATING PIPELINE IMAGE PROCESSOR")
+        print("=" * 60)
+
+        # 检查processor类型和属性
+        processor = self.pipe.image_processor
+        print(f"Processor type: {type(processor)}")
+        print(f"Processor dir: {[attr for attr in dir(processor) if not attr.startswith('_')]}")
+
+        # 检查是否有normalize参数
+        if hasattr(processor, 'do_normalize'):
+            print(f"do_normalize: {processor.do_normalize}")
+        if hasattr(processor, 'image_mean'):
+            print(f"image_mean: {processor.image_mean}")
+        if hasattr(processor, 'image_std'):
+            print(f"image_std: {processor.image_std}")
+        if hasattr(processor, 'config'):
+            print(f"config: {processor.config}")
+
+        # 测试一个简单的红色图像
+        test_img = Image.new('RGB', (256, 256), color=(255, 0, 0))  # 纯红色
+        processed = processor.preprocess(test_img, height=256, width=256)
+
+        print(f"Test image (pure red) processed result:")
+        print(f"  Shape: {processed.shape}")
+        print(f"  Dtype: {processed.dtype}")
+        print(f"  Range: [{processed.min():.6f}, {processed.max():.6f}]")
+        print(f"  Mean per channel: {processed.mean(dim=[2,3])}")
+
+        # 如果是normalize的话，红色通道应该是(1-mean)/std的值
+
+    def quick_fix_preprocess_subject_image(self, image: Image.Image, cond_size: int = 512) -> torch.Tensor:
+        """
+        快速修复版本的预处理，避免使用pipeline的processor
+        """
+        # 直接使用torchvision的操作，不依赖pipeline processor
+        from torchvision import transforms
+
+        w, h = image.size
+        scale = cond_size / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+
+        # 使用torchvision的transforms
+        transform = transforms.Compose([
+            transforms.Resize((new_h, new_w)),
+            transforms.ToTensor(),  # 自动归一化到[0,1]
+        ])
+
+        tensor = transform(image).unsqueeze(0)  # 添加batch维度
+
+        # 手动padding到目标尺寸
+        pad_h = cond_size - new_h
+        pad_w = cond_size - new_w
+
+        tensor = F.pad(tensor, 
+                        (pad_w//2, pad_w-pad_w//2, pad_h//2, pad_h-pad_h//2), 
+                        mode='constant', value=0)
+
+        return tensor.to(device=self.device, dtype=torch.float32)
+
+    def test_conversion_round_trip(self, original_image: Image.Image):
+        """
+        测试转换的往返一致性
+        """
+        print("=" * 60)
+        print("TESTING CONVERSION ROUND TRIP")
+        print("=" * 60)
+
+        # 测试1：原始方法
+        print("Test 1: Original pipeline method")
+        try:
+            tensor1 = self.preprocess_subject_image(original_image)
+            pil1 = self.tensor_to_pil(tensor1)
+            tensor1_back = self.preprocess_subject_image(pil1)
+            diff1 = torch.abs(tensor1 - tensor1_back).max()
+            print(f"  Round trip difference: {diff1.item():.6f}")
+        except Exception as e:
+            print(f"  Error: {e}")
+            diff1 = float('inf')
+
+        # 测试2：快速修复方法
+        print("Test 2: Quick fix method")
+        try:
+            tensor2 = self.quick_fix_preprocess_subject_image(original_image)
+            pil2 = self.tensor_to_pil(tensor2)
+            tensor2_back = self.quick_fix_preprocess_subject_image(pil2)
+            diff2 = torch.abs(tensor2 - tensor2_back).max()
+            print(f"  Round trip difference: {diff2.item():.6f}")
+        except Exception as e:
+            print(f"  Error: {e}")
+            diff2 = float('inf')
+
+        # 测试3：纯tensor方法（无PIL转换）
+        print("Test 3: Pure tensor method (no PIL conversion)")
+        try:
+            tensor3 = self.quick_fix_preprocess_subject_image(original_image)
+            # 添加小扰动
+            epsilon = 8/255
+            delta = torch.randn_like(tensor3) * epsilon * 0.1
+            adversarial_tensor = torch.clamp(tensor3 + delta, 0, 1)
+            
+            # 直接计算差异，不经过PIL
+            diff3 = torch.abs(tensor3 - adversarial_tensor).max()
+            expected_diff = torch.abs(delta).max()
+            print(f"  Expected difference: {expected_diff.item():.6f}")
+            print(f"  Actual difference: {diff3.item():.6f}")
+            print(f"  Ratio: {(diff3/expected_diff).item():.3f}")
+        except Exception as e:
+            print(f"  Error: {e}")
+
+        return diff1.item() if diff1 != float('inf') else None, \
+                diff2.item() if diff2 != float('inf') else None
+
+    def emergency_gradient_test(self, original_image: Image.Image):
+        """
+        紧急梯度测试 - 最简单的版本
+        """
+        print("=" * 60)
+        print("EMERGENCY GRADIENT TEST")
+        print("=" * 60)
+
+        # 使用最简单的tensor操作
+        tensor = self.quick_fix_preprocess_subject_image(original_image)
+
+        # 创建需要梯度的扰动
+        delta = torch.zeros_like(tensor, requires_grad=True, device=self.device)
+
+        print(f"Delta requires_grad: {delta.requires_grad}")
+
+        # 最简单的损失函数
+        adversarial = tensor + delta
+        simple_loss = adversarial.sum()  # 最简单的损失
+
+        print(f"Simple loss: {simple_loss.item():.6f}")
+        print(f"Simple loss requires_grad: {simple_loss.requires_grad}")
+
+        # 反向传播
+        try:
+            simple_loss.backward()
+            if delta.grad is not None:
+                print(f"✅ Gradient computed! Norm: {delta.grad.norm().item():.6f}")
+                return True
+            else:
+                print("❌ Gradient is None!")
+                return False
+        except Exception as e:
+            print(f"❌ Backward failed: {e}")
+            return False
+
+        # 在你的主要攻击方法之前，先运行这些诊断
+    def run_emergency_diagnosis(self, original_image: Image.Image):
+        """
+        运行紧急诊断
+        """
+        print("🔍 Running emergency diagnosis...")
+
+        # 1. 调查processor
+        self.investigate_pipeline_processor()
+
+        # 2. 测试转换一致性
+        diff1, diff2 = self.test_conversion_round_trip(original_image)
+
+        # 3. 测试梯度
+        gradient_ok = self.emergency_gradient_test(original_image)
+
+        # 4. 给出建议
+        print("\n" + "=" * 60)
+        print("EMERGENCY DIAGNOSIS RESULTS")
+        print("=" * 60)
+
+        if diff1 is not None and diff1 > 0.01:
+            print("❌ Pipeline processor method has consistency issues")
+            print("💡 Recommendation: Use quick_fix_preprocess_subject_image instead")
+
+        if diff2 is not None and diff2 < 0.01:
+            print("✅ Quick fix method shows good consistency")
+
+        if gradient_ok:
+            print("✅ Basic gradient flow is working")
+        else:
+            print("❌ Gradient flow is broken")
+
+        return {
+            'pipeline_diff': diff1,
+            'quickfix_diff': diff2,
+            'gradient_ok': gradient_ok
+        }
     
     def _init_pipeline(self, base_path: str, subject_lora_path: str):
         """初始化EasyControl pipeline"""
-        
+        print("-" * 50)
+        print(base_path)
+        print("-" * 50)
         # 加载pipeline
         self.pipe = FluxPipeline.from_pretrained(
             base_path, 
             torch_dtype=torch.bfloat16, 
-            device=self.device
+            device=self.device,
+            local_files_only=True
         )
         
         # 加载transformer
@@ -135,7 +329,8 @@ class OptimizedAdversarialGenerator:
             base_path, 
             subfolder="transformer",
             torch_dtype=torch.bfloat16, 
-            device=self.device
+            device=self.device,
+            local_files_only=True
         )
         self.pipe.transformer = transformer
         self.pipe.to(self.device)
@@ -148,7 +343,7 @@ class OptimizedAdversarialGenerator:
         
         logger.info("EasyControl pipeline initialized successfully!")
     
-    def clear_cache(transformer):
+    def clear_cache(self, transformer):
         for name, attn_processor in transformer.attn_processors.items():
             attn_processor.bank_kv.clear()    
     
@@ -189,7 +384,7 @@ class OptimizedAdversarialGenerator:
         if len(tensor.shape) == 3 and tensor.shape[0] == 3:
             tensor = tensor.permute(1, 2, 0)
         
-        image_np = (tensor.numpy() * 255).astype(np.uint8)
+        image_np = (tensor.detach().numpy() * 255).astype(np.uint8)
         return Image.fromarray(image_np)
     
     def generate_with_subject(self, prompt: str, subject_image: Image.Image, 
@@ -199,7 +394,7 @@ class OptimizedAdversarialGenerator:
         """
         使用subject control生成图片
         """
-        generation_func = self.pipe if not enable_grad else self.pipe
+        generation_func = self.pipe
         
         if enable_grad:
             # 启用梯度计算
@@ -229,8 +424,7 @@ class OptimizedAdversarialGenerator:
                     cond_size=512,
                 ).images[0]
         
-        # 智能缓存清理
-        self.clear_cache()
+
         return image
     
     def compute_single_prompt_mse(self, original_img: Image.Image, 
@@ -243,12 +437,12 @@ class OptimizedAdversarialGenerator:
             generated_original = self.generate_with_subject(
                 self.attack_prompt, original_img, enable_grad=True
             )
-            
+            self.clear_cache(self.pipe.transformer)
             # 生成对抗图片结果
             generated_adversarial = self.generate_with_subject(
                 self.attack_prompt, adversarial_img, enable_grad=True
             )
-            
+            self.clear_cache(self.pipe.transformer)
             # 使用pipeline的图像处理器进行预处理以保持一致性
             orig_tensor = self.pipe.image_processor.preprocess(generated_original)
             adv_tensor = self.pipe.image_processor.preprocess(generated_adversarial)
@@ -274,8 +468,20 @@ class OptimizedAdversarialGenerator:
         """
         对单张图片进行PGD攻击 - 优化版本
         """
-        # 使用pipeline的预处理方法
-        original_tensor = self.preprocess_subject_image(original_image, cond_size=512)
+        # 🔍 首先运行诊断
+        print("🔍 Running emergency diagnosis...")
+        diagnosis_results = self.run_emergency_diagnosis(original_image)
+        
+        # 根据诊断结果选择预处理方法
+        if diagnosis_results['pipeline_diff'] is None or diagnosis_results['pipeline_diff'] > 0.01:
+            print("⚠️  Using quick fix preprocessing due to pipeline issues")
+            preprocess_func = self.quick_fix_preprocess_subject_image
+        else:
+            print("✅ Using original pipeline preprocessing")
+            preprocess_func = self.preprocess_subject_image
+            
+        # 使用选定的预处理方法
+        original_tensor = preprocess_func(original_image, cond_size=512)
         original_tensor.requires_grad_(False)  # 原始图片不需要梯度
         
         # 初始化随机噪声
@@ -289,7 +495,8 @@ class OptimizedAdversarialGenerator:
             'alpha': alpha,
             'num_iterations': num_iterations,
             'lambda_reg': lambda_reg,
-            'attack_prompt': self.attack_prompt
+            'attack_prompt': self.attack_prompt,
+            'used_quick_fix': diagnosis_results['pipeline_diff'] is None or diagnosis_results['pipeline_diff'] > 0.01
         }
         
         logger.info(f"Using attack prompt: '{self.attack_prompt}'")
@@ -301,7 +508,17 @@ class OptimizedAdversarialGenerator:
             adversarial_tensor = torch.clamp(original_tensor + delta, 0, 1)
             adversarial_image = self.tensor_to_pil(adversarial_tensor)
             
-            # 计算单prompt损失
+            # 🔧 修复：使用选定的预处理方法进行测试，而不是固定使用原始方法
+            reconstructed_tensor = preprocess_func(adversarial_image)
+            actual_diff = torch.abs(original_tensor - reconstructed_tensor).max()
+            
+            print(f"Iter {i+1}: Expected diff={torch.abs(delta).max().item():.6f}, "
+                f"Actual diff={actual_diff.item():.6f}")
+            
+            if actual_diff.item() < 1e-6:
+                print("⚠️  WARNING: 扰动在转换过程中丢失了！")
+
+            # return mse损失
             mse_loss = self.compute_single_prompt_mse(original_image, adversarial_image)
             
             # 计算正则化项 (L∞范数)
@@ -332,6 +549,7 @@ class OptimizedAdversarialGenerator:
             
             # 清零梯度
             delta.grad = None
+            
         return delta.detach(), attack_info
     
     def process_dataset(self, 
@@ -346,8 +564,9 @@ class OptimizedAdversarialGenerator:
         """
         处理整个数据集
         """
-        
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        def custom_collate_fn(batch):
+            return batch 
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
         
         # 创建进度条
         total_samples = len(dataset)
@@ -372,9 +591,9 @@ class OptimizedAdversarialGenerator:
                 
                 try:
                     # 获取图片（当前batch_size=1）
-                    original_image = batch['image'][0]
-                    image_path = batch['image_path'][0]
-                    image_idx = batch['index'][0].item()
+                    original_image = batch[0]['image']
+                    image_path = batch[0]['image_path']
+                    image_idx = batch[0]['index']
                     
                     # 检查图片质量
                     if original_image.size[0] < 256 or original_image.size[1] < 256:
@@ -485,9 +704,9 @@ def main():
                        help="Use only a subset of the dataset")
     
     # 模型参数
-    parser.add_argument("--base_model", type=str, default="black-forest-labs/FLUX.1-dev",
+    parser.add_argument("--base_model", type=str, default="/openbayes/input/input0",
                        help="Base FLUX model path")
-    parser.add_argument("--subject_lora", type=str, default="./checkpoints/models/subject.safetensors",
+    parser.add_argument("--subject_lora", type=str, default="/openbayes/input/input0/subject.safetensors",
                        help="Subject LoRA model path")
     
     # 攻击参数
@@ -548,12 +767,11 @@ if __name__ == "__main__":
 # 使用示例脚本
 """
 # 基本使用
-python optimized_adversarial_generator.py \
-    --data_root /path/to/laionface \
-    --subset_size 1000 \
+python adversarial_generator.py \
+    --data_root /openbayes/input/input0/sample_faces \
     --output_dir ./results \
     --epsilon 0.03137 \
-    --num_iterations 20
+    --num_iterations 50
 
 # 高质量攻击（更多迭代）
 python optimized_adversarial_generator.py \
