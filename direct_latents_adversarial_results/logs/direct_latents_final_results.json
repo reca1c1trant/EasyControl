@@ -1,0 +1,31 @@
+{
+  "total_samples": 1,
+  "success_count": 0,
+  "success_rate": 0.0,
+  "average_mse": 0.0,
+  "gradient_statistics": {
+    "total_gradient_checks": 0,
+    "successful_gradients": 0,
+    "gradient_success_rate": 0.0
+  },
+  "method_info": {
+    "method": "DIRECT_LATENTS_ATTACK",
+    "attack_target": "main_latents_shape_(1,4096,16)",
+    "mse_comparison": "denoised_latents_space",
+    "advantages": [
+      "Direct perturbation on main latents",
+      "Stable gradient flow",
+      "Precise control over perturbation magnitude",
+      "Follows EasyControl pipeline exactly",
+      "Subject conditions remain fixed"
+    ],
+    "parameters": {
+      "epsilon": 0.1,
+      "alpha": 0.02,
+      "num_iterations": 50,
+      "lambda_reg": 0.1
+    }
+  },
+  "results": [],
+  "timestamp": "2025-06-18T17:29:25.052125"
+}

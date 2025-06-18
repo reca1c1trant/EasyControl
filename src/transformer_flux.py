@@ -446,7 +446,7 @@ class FluxTransformer2DModel(
             if guidance is None
             else self.time_text_embed(timestep, guidance, pooled_projections)
         )
-        
+
         cond_temb = (
             self.time_text_embed(torch.ones_like(timestep) * 0, pooled_projections)
                 if guidance is None
@@ -454,7 +454,6 @@ class FluxTransformer2DModel(
                     torch.ones_like(timestep) * 0, guidance, pooled_projections
                 )
             )
-        
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         if txt_ids.ndim == 3:
@@ -477,29 +476,29 @@ class FluxTransformer2DModel(
             ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
-
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
+                    def custom_forward(*inputs, **kwargs):
                         if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
+                            return module(*inputs, return_dict=return_dict, **kwargs)
                         else:
-                            return module(*inputs)
+                            return module(*inputs, **kwargs)
 
                     return custom_forward
 
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                encoder_hidden_states, hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                    cond_temb=cond_temb if use_condition else None,
-                    cond_hidden_states=cond_hidden_states if use_condition else None,
-                    **ckpt_kwargs,
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": True} if is_torch_version(">=", "1.11.0") else {}
+                encoder_hidden_states, hidden_states, cond_hidden_states = torch.utils.checkpoint.checkpoint(
+    create_custom_forward(block),
+    hidden_states,                                  # ✅ 位置参数1
+    cond_hidden_states if use_condition else None, # ✅ 位置参数2
+    encoder_hidden_states,                          # ✅ 位置参数3
+    temb,                                           # ✅ 位置参数4
+    cond_temb if use_condition else None,           # ✅ 位置参数5
+    image_rotary_emb,                               # ✅ 位置参数6
+    joint_attention_kwargs,                         # ✅ 位置参数7
+    **ckpt_kwargs,                                  # checkpoint自身参数
                 )
 
             else:
@@ -530,23 +529,24 @@ class FluxTransformer2DModel(
             if torch.is_grad_enabled() and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
+                    def custom_forward(*inputs, **kwargs):
                         if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
+                            return module(*inputs, return_dict=return_dict, **kwargs)
                         else:
-                            return module(*inputs)
+                            return module(*inputs, **kwargs)
 
                     return custom_forward
 
-                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": True} if is_torch_version(">=", "1.11.0") else {}
                 hidden_states, cond_hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    temb,
-                    image_rotary_emb,
-                    cond_temb=cond_temb if use_condition else None,
-                    cond_hidden_states=cond_hidden_states if use_condition else None,
-                    **ckpt_kwargs,
+    create_custom_forward(block),
+    hidden_states,                                  # ✅ 位置参数1
+    cond_hidden_states if use_condition else None, # ✅ 位置参数2  
+    temb,                                           # ✅ 位置参数3
+    cond_temb if use_condition else None,           # ✅ 位置参数4
+    image_rotary_emb,                               # ✅ 位置参数5
+    joint_attention_kwargs,                         # ✅ 位置参数6
+    **ckpt_kwargs,                                  # checkpoint自身参数
                 )
 
             else:
