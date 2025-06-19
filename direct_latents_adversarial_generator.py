@@ -118,14 +118,6 @@ class GradientDiagnosticsMixin:
             else:
                 logger.info(f"{name}: No parameters or component is None")
  
-    def log_memory_usage(self, step_name: str):
-        """记录内存使用情况"""
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            free = total - reserved
-            logger.info(f"{step_name}: GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Free: {free:.2f}GB")
  
 class MemoryOptimizedFluxPipeline(FluxPipeline, GradientDiagnosticsMixin):
     """内存优化的FluxPipeline"""
@@ -225,14 +217,12 @@ class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
             dir_path.mkdir(exist_ok=True)
         
         logger.info("Initializing DIRECT-LATENTS adversarial generator...")
-        self.log_memory_usage("Before initialization")
         
         self._init_pipeline(base_path, subject_lora_path)
         
         self.attack_prompt = "A SKS on the beach"
         logger.info(f"Using attack prompt: '{self.attack_prompt}'")
         
-        self.log_memory_usage("After initialization")
         
         # 测试基础功能
         self._test_basic_gradients()
@@ -415,10 +405,10 @@ class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
         """
         使用扰动后的主要latents进行去噪，返回去噪后的latents
         """
-        if enable_grad:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-            torch.use_deterministic_algorithms(True, warn_only=True)
+#        if enable_grad:
+#            torch.backends.cudnn.deterministic = True
+#            torch.backends.cudnn.benchmark = False
+#            torch.use_deterministic_algorithms(True, warn_only=True)
         
         logger.debug(f"Starting denoising with main_latents shape: {main_latents.shape}")
         
@@ -538,15 +528,11 @@ class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
         4. 梯度更新delta噪声
         """
         
-        # 第一步：准备clean latents和条件
-        self.log_memory_usage("Before clean preparation")
         
         clean_main_latents, subject_condition_latents, pipeline_components = self.prepare_clean_latents_and_conditions(
             original_image
         )
         
-        self.log_memory_usage("After clean preparation")
-
         
         # 第二步：计算clean的去噪结果
         with torch.no_grad():
@@ -556,7 +542,6 @@ class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
             clean_denoised_latents = clean_denoised_latents.detach().to(device=str(self.device), dtype=torch.bfloat16)
             clean_denoised_latents.requires_grad_(False)
         
-        self.log_memory_usage("After clean denoising")
         
         # 第三步：初始化可学习的扰动delta
         # 扰动的shape与main_latents相同: (1, 4096, 16)
@@ -587,7 +572,6 @@ class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
         max_consecutive_failures = 5
         
         for i in range(num_iterations):
-            self.log_memory_usage(f"Iteration {i+1} start")
             
             delta_perturbation.requires_grad_(True)
             
@@ -676,7 +660,6 @@ class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
             # 内存清理
             if i % 5 == 0:
                 torch.cuda.empty_cache()
-                self.log_memory_usage(f"Iteration {i+1} after cleanup")
         
         logger.info("DIRECT-LATENTS PGD attack completed!")
         logger.info(f"Final gradient status: {attack_info['gradient_status'][-5:] if attack_info['gradient_status'] else 'No gradients'}")
@@ -750,7 +733,6 @@ class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
                         logger.warning(f"Skipping small image {image_path}")
                         continue
                     
-                    self.log_memory_usage(f"Processing image {batch_idx+1}")
                     
                     # 执行直接latents PGD攻击
                     delta_perturbation, attack_info = self.pgd_attack_direct_latents(
