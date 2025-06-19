@@ -110,7 +110,7 @@ class ImageSpaceAdversarialGenerator:
         
         # 使用pipeline的image_processor预处理
         tensor = self.pipe.image_processor.preprocess(image, height=new_h, width=new_w)
-        tensor = tensor.to(dtype=torch.float32)
+        tensor = tensor.to(dtype=torch.bfloat16)
         
         # Padding到cond_size
         pad_h = self.cond_size - tensor.shape[-2]
@@ -317,10 +317,10 @@ class ImageSpaceAdversarialGenerator:
         prompt_embeds, pooled_prompt_embeds, text_ids, latent_image_ids = pipeline_components
         
         # Phase 2: 初始化delta在图像空间 [512,512,3]
-        delta = torch.zeros_like(clean_image_tensor, requires_grad=True, device=self.device, dtype=torch.float32)
+        delta = torch.zeros_like(clean_image_tensor, requires_grad=True, device=self.device, dtype=torch.bfloat16)
         
         with torch.no_grad():
-            delta.data = (torch.randn_like(clean_image_tensor) * epsilon * 0.1).to(device=self.device, dtype=torch.float32)
+            delta.data = (torch.randn_like(clean_image_tensor) * epsilon * 0.1).to(device=self.device, dtype=torch.bfloat16)
         
         attack_info = {'loss_history': [], 'mse_history': []}
         consecutive_failures = 0
@@ -368,8 +368,8 @@ class ImageSpaceAdversarialGenerator:
             attack_info['loss_history'].append(total_loss.item())
             attack_info['mse_history'].append(mse_loss.item())
             
-            if i % 10 == 0:
-                print(f"Iter {i+1}: MSE={mse_loss.item():.6f}, L∞={linf_norm.item():.6f}")
+
+            print(f"Iter {i+1}: MSE={mse_loss.item():.6f}, L_inf={linf_norm.item():.6f}, Total_loss={total_loss.item():.6f}")
             
             # ✅ 要求4: 反向传播，用PGD来更新delta
             total_loss.backward()
@@ -484,7 +484,7 @@ def process_single_image(generator: ImageSpaceAdversarialGenerator,
         
         # 生成最终三种结果
         clean_generated, adversarial_generated, noisy_original = generator.generate_final_results(
-            image, delta, clean_final_latents, clean_main_latents, pipeline_components, clean_image_tensor
+            delta, clean_final_latents, clean_main_latents, pipeline_components, clean_image_tensor
         )
         
         # 计算最终指标
@@ -543,7 +543,7 @@ def main():
         image=test_image,
         epsilon=0.03,
         alpha=0.01,
-        num_iterations=2,
+        num_iterations=5,
         lambda_reg=0.1
     )
     
