@@ -20,11 +20,14 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(script_dir)
 sys.path.insert(0, script_dir)
 sys.path.insert(0, parent_dir)
+ 
+# 尝试多种导入路径
 
 from src.pipeline import FluxPipeline
 from src.transformer_flux import FluxTransformer2DModel
 from src.lora_helper import set_single_lora
 
+ 
 # 设置环境变量优化内存
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
@@ -75,7 +78,56 @@ class LAIONFaceDataset(Dataset):
             dummy_image = Image.new('RGB', (512, 512), color='white')
             return {'image': dummy_image, 'image_path': str(image_path), 'index': idx}
  
-class MemoryOptimizedFluxPipeline(FluxPipeline):
+class GradientDiagnosticsMixin:
+    """梯度诊断混合类"""
+    
+    def diagnose_gradient_flow(self, tensor: torch.Tensor, name: str = "tensor") -> bool:
+        """诊断梯度流动情况"""
+        if tensor.grad is None:
+            logger.warning(f"{name}: No gradient")
+            return False
+        
+        grad_norm = tensor.grad.norm().item()
+        grad_max = tensor.grad.abs().max().item()
+        grad_min = tensor.grad.abs().min().item()
+        
+        logger.debug(f"{name} gradient - norm: {grad_norm:.6f}, max: {grad_max:.6f}, min: {grad_min:.6f}")
+        
+        if grad_norm < 1e-8:
+            logger.warning(f"{name}: Gradient too small (vanishing): {grad_norm:.2e}")
+            return False
+        elif grad_norm > 1e6:
+            logger.warning(f"{name}: Gradient too large (exploding): {grad_norm:.2e}")
+            return False
+        
+        return True
+    
+    def check_model_gradients(self, model):
+        """检查模型各部分是否启用梯度"""
+        components = {
+            'transformer': model.transformer,
+            'vae': model.vae,
+            'text_encoder': model.text_encoder if hasattr(model, 'text_encoder') else None,
+        }
+        
+        for name, component in components.items():
+            if component is not None and hasattr(component, 'parameters'):
+                param_count = sum(1 for p in component.parameters())
+                grad_enabled_count = sum(1 for p in component.parameters() if p.requires_grad)
+                logger.info(f"{name}: {grad_enabled_count}/{param_count} parameters have gradients enabled")
+            else:
+                logger.info(f"{name}: No parameters or component is None")
+ 
+    def log_memory_usage(self, step_name: str):
+        """记录内存使用情况"""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            free = total - reserved
+            logger.info(f"{step_name}: GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Free: {free:.2f}GB")
+ 
+class MemoryOptimizedFluxPipeline(FluxPipeline, GradientDiagnosticsMixin):
     """内存优化的FluxPipeline"""
     
     def preprocess_subject_tensor(self, subject_tensor: torch.Tensor, cond_size: int = 512) -> torch.Tensor:
@@ -151,7 +203,7 @@ def retrieve_latents(encoder_output: torch.Tensor, generator: Optional[torch.Gen
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
  
-class DirectLatentsAdversarialGenerator:
+class DirectLatentsAdversarialGenerator(GradientDiagnosticsMixin):
     """直接在主要latents上加扰动的对抗样本生成器"""
     
     def __init__(self, 
@@ -160,7 +212,7 @@ class DirectLatentsAdversarialGenerator:
                  device: str = "cuda",
                  output_dir: str = "./direct_latents_adversarial_results"):
         
-        self.device = torch.device(device)
+        self.device = torch.device(device)  # 修复：转换为torch.device对象
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -173,13 +225,20 @@ class DirectLatentsAdversarialGenerator:
             dir_path.mkdir(exist_ok=True)
         
         logger.info("Initializing DIRECT-LATENTS adversarial generator...")
+        self.log_memory_usage("Before initialization")
+        
         self._init_pipeline(base_path, subject_lora_path)
         
         self.attack_prompt = "A SKS on the beach"
         logger.info(f"Using attack prompt: '{self.attack_prompt}'")
         
+        self.log_memory_usage("After initialization")
+        
+        # 测试基础功能
+        self._test_basic_gradients()
+        
     def _init_pipeline(self, base_path: str, subject_lora_path: str):
-        """初始化pipeline"""
+        """初始化pipeline - 只启用Transformer梯度"""
         logger.info("Loading base model...")
         self.pipe = MemoryOptimizedFluxPipeline.from_pretrained(
             base_path, 
@@ -187,6 +246,7 @@ class DirectLatentsAdversarialGenerator:
             local_files_only=True
         )
         
+        logger.info("Loading transformer...")
         transformer = FluxTransformer2DModel.from_pretrained(
             base_path, 
             subfolder="transformer",
@@ -196,24 +256,46 @@ class DirectLatentsAdversarialGenerator:
         self.pipe.transformer = transformer
         self.pipe.to(self.device)
         
+        logger.info("Loading LoRA...")
         # 加载subject control LoRA
         set_single_lora(self.pipe.transformer, subject_lora_path, lora_weights=[1], cond_size=512)
         
-        # 设置梯度
+        # 关键：只启用Transformer梯度，VAE完全frozen
+        logger.info("Setting up gradients...")
         self.pipe.transformer.requires_grad_(True)
-        self.pipe.vae.requires_grad_(False)
+        self.pipe.vae.requires_grad_(False)  # 显式禁用VAE梯度
         self.pipe.transformer.gradient_checkpointing = True
-        
         # 禁用VAE的优化功能
         if hasattr(self.pipe.vae, 'disable_slicing'):
             self.pipe.vae.disable_slicing()
         if hasattr(self.pipe.vae, 'disable_tiling'):
             self.pipe.vae.disable_tiling()
         
-        logger.info("Pipeline initialized successfully")
+        logger.info("DIRECT-LATENTS pipeline initialized!")
+        logger.info("VAE gradients DISABLED, MSE comparison in denoised latent space")
+        logger.info(f"VAE dtype: {self.pipe.vae.dtype}")
+        
+        # 诊断梯度设置
+        self.check_model_gradients(self.pipe)
+    
+    def encode_image_to_latents(self, image: Image.Image) -> torch.Tensor:
+        """将图像编码为latents（无梯度）"""
+        with torch.no_grad():  # VAE编码无梯度
+            # 预处理图像
+            tensor = self.preprocess_to_tensor(image, cond_size=512)
+            
+            # 修复：确保输入tensor与VAE模型数据类型一致
+            tensor = tensor.to(dtype=self.pipe.vae.dtype, device=str(self.device))
+            
+            # 修复：generator设备类型与计算设备一致
+            generator = torch.Generator(str(self.device)).manual_seed(42)
+            latents = self._encode_vae_image(tensor, generator)
+            
+            return latents.to(device=str(self.device), dtype=torch.bfloat16)
     
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
         """编码VAE图像"""
+        # 修复：确保输入与VAE模型数据类型一致
         image = image.to(dtype=self.pipe.vae.dtype, device=str(self.device))
         
         if isinstance(generator, list):
@@ -229,8 +311,9 @@ class DirectLatentsAdversarialGenerator:
         return image_latents
     
     def decode_latents_to_tensor(self, latents: torch.Tensor) -> torch.Tensor:
-        """将latents解码为图像tensor"""
-        with torch.no_grad():
+        """将latents解码为图像tensor（用于最终显示）"""
+        with torch.no_grad():  # 最终解码不需要梯度
+            # 修复：确保latents与VAE模型数据类型一致
             latents = (latents / self.pipe.vae.config.scaling_factor) + self.pipe.vae.config.shift_factor
             latents = latents.to(dtype=self.pipe.vae.dtype, device=str(self.device))
             decoded_tensor = self.pipe.vae.decode(latents, return_dict=False)[0]
@@ -243,6 +326,7 @@ class DirectLatentsAdversarialGenerator:
         new_h, new_w = int(h * scale), int(w * scale)
         
         tensor = self.pipe.image_processor.preprocess(image, height=new_h, width=new_w)
+        # 修复：暂时保持bfloat16，在使用时再转换为VAE的数据类型
         tensor = tensor.to(dtype=torch.bfloat16)
         
         return tensor.to(device=str(self.device))
@@ -250,26 +334,25 @@ class DirectLatentsAdversarialGenerator:
     def prepare_clean_latents_and_conditions(self, subject_image: Image.Image, 
                                            height: int = 1024, width: int = 1024) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
-        准备clean latents和条件信息
+        按照pipeline.py逻辑准备clean latents和条件信息
         返回：(clean_main_latents, subject_condition_latents, pipeline_components)
         """
-        logger.info("Preparing clean latents...")
         
         batch_size = 1
-        device = self.device
+        device = self.device  # torch.device对象
         cond_size = 512
         
         with torch.no_grad():
-            # 编码prompt
+            # 1. 编码prompt
             prompt_embeds, pooled_prompt_embeds, text_ids = self.pipe.encode_prompt(
                 prompt=self.attack_prompt,
                 prompt_2=self.attack_prompt,
-                device=str(device),
+                device=str(device),  # 修复：encode_prompt需要字符串设备名
                 num_images_per_prompt=1,
                 max_sequence_length=512,
             )
             
-            # 准备subject图像
+            # 2. 准备subject图像
             w, h = subject_image.size
             scale = cond_size / max(h, w)
             new_h, new_w = int(h * scale), int(w * scale)
@@ -285,31 +368,33 @@ class DirectLatentsAdversarialGenerator:
                 padding=(int(pad_w / 2), int(pad_h / 2), int(pad_w / 2), int(pad_h / 2)),
                 fill=0
             )
+
             
-            # 调用原始pipeline的prepare_latents方法
+            # 3. 调用原始pipeline的prepare_latents（但不使用spatial_images）
             self.pipe.cond_size = cond_size
             num_channels_latents = self.pipe.transformer.config.in_channels // 4  # 16
             
-            generator = torch.Generator(str(device)).manual_seed(42)
+            generator = torch.Generator(str(device)).manual_seed(42)  # 固定种子
             
+            # 直接调用原始pipeline的prepare_latents方法
             cond_latents, latent_image_ids, clean_main_latents = self.pipe.prepare_latents(
                 batch_size,
                 num_channels_latents,
                 height,
                 width,
                 prompt_embeds.dtype,
-                device,
+                device,  # 修复：prepare_latents需要字符串设备名
                 generator,
-                subject_image=subject_image_tensor,
-                condition_image=None,
+                subject_image=subject_image_tensor,  # subject图像
+                condition_image=None,  # 不使用spatial条件
                 latents=None,
-                cond_number=0,
-                sub_number=1
+                cond_number=0,  # 没有spatial条件
+                sub_number=1    # 一个subject
             )
             
-            logger.info(f"Clean main latents: {clean_main_latents.shape}, Condition latents: {cond_latents.shape}")
+            logger.debug(f"Prepared latents - main: {clean_main_latents.shape}, cond: {cond_latents.shape}, ids: {latent_image_ids.shape}")
             
-            # 返回组件信息
+            # 4. 返回组件信息
             pipeline_components = {
                 'prompt_embeds': prompt_embeds,
                 'pooled_prompt_embeds': pooled_prompt_embeds,
@@ -317,7 +402,7 @@ class DirectLatentsAdversarialGenerator:
                 'latent_image_ids': latent_image_ids,
                 'height': height,
                 'width': width,
-                'num_inference_steps': 5, # 这里设置为5了
+                'num_inference_steps': 5,
                 'guidance_scale': 3.5
             }
             
@@ -335,6 +420,8 @@ class DirectLatentsAdversarialGenerator:
             torch.backends.cudnn.benchmark = False
             torch.use_deterministic_algorithms(True, warn_only=True)
         
+        logger.debug(f"Starting denoising with main_latents shape: {main_latents.shape}")
+        
         # 提取pipeline组件
         prompt_embeds = pipeline_components['prompt_embeds']
         pooled_prompt_embeds = pipeline_components['pooled_prompt_embeds']
@@ -345,8 +432,8 @@ class DirectLatentsAdversarialGenerator:
         num_inference_steps = pipeline_components['num_inference_steps']
         guidance_scale = pipeline_components['guidance_scale']
         
-        device = self.device
-        latents = main_latents.clone()
+        device = self.device  # torch.device对象
+        latents = main_latents.clone()  # 复制以避免修改原始tensor
         
         with torch.set_grad_enabled(enable_grad):
             # 准备timesteps
@@ -362,7 +449,7 @@ class DirectLatentsAdversarialGenerator:
             timesteps, num_inference_steps = retrieve_timesteps(
                 self.pipe.scheduler,
                 num_inference_steps,
-                str(device),
+                str(device),  # 修复：scheduler需要字符串设备名
                 None,
                 sigmas,
                 mu=mu,
@@ -381,11 +468,9 @@ class DirectLatentsAdversarialGenerator:
                     attn_processor.bank_kv.clear()
                 if hasattr(attn_processor, '_cache'):
                     attn_processor._cache = None
-            
             original_training_mode = self.pipe.transformer.training
             if enable_grad:
                 self.pipe.transformer.eval()
-            
             # Warmup缓存
             start_idx = latents.shape[1] - 32
             warmup_latents = latents[:, start_idx:, :]
@@ -414,8 +499,8 @@ class DirectLatentsAdversarialGenerator:
 
                     # transformer推理
                     noise_pred = self.pipe.transformer(
-                        hidden_states=latents,
-                        cond_hidden_states=cond_latents,
+                        hidden_states=latents,           # 主要latents（包含扰动）
+                        cond_hidden_states=cond_latents, # 条件latents（固定）
                         timestep=timestep / 1000,
                         guidance=guidance,
                         pooled_projections=pooled_prompt_embeds,
@@ -428,6 +513,7 @@ class DirectLatentsAdversarialGenerator:
 
                     # 调度器更新
                     latents = self.pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
             finally:
                 # 恢复原始状态
                 self.pipe.transformer.train(original_training_mode)
@@ -435,7 +521,6 @@ class DirectLatentsAdversarialGenerator:
                     torch.backends.cudnn.deterministic = False
                     torch.backends.cudnn.benchmark = True
                     torch.use_deterministic_algorithms(False)
-            
             return latents
     
     def pgd_attack_direct_latents(self, 
@@ -446,15 +531,24 @@ class DirectLatentsAdversarialGenerator:
                                 lambda_reg: float = 0.1) -> Tuple[torch.Tensor, Dict]:
         """
         直接在主要latents上进行PGD攻击
+        算法：
+        1. 记录clean_main_latents和clean_denoised_latents  
+        2. 在iteration中直接对main_latents加噪声
+        3. 在denoised_latents比较MSE
+        4. 梯度更新delta噪声
         """
         
-        # 准备clean latents和条件
+        # 第一步：准备clean latents和条件
+        self.log_memory_usage("Before clean preparation")
+        
         clean_main_latents, subject_condition_latents, pipeline_components = self.prepare_clean_latents_and_conditions(
             original_image
         )
         
-        # 计算clean的去噪结果
-        logger.info("Computing clean denoised latents...")
+        self.log_memory_usage("After clean preparation")
+
+        
+        # 第二步：计算clean的去噪结果
         with torch.no_grad():
             clean_denoised_latents = self.denoise_latents_with_perturbation(
                 clean_main_latents, subject_condition_latents, pipeline_components, enable_grad=False
@@ -462,7 +556,10 @@ class DirectLatentsAdversarialGenerator:
             clean_denoised_latents = clean_denoised_latents.detach().to(device=str(self.device), dtype=torch.bfloat16)
             clean_denoised_latents.requires_grad_(False)
         
-        # 初始化可学习的扰动delta
+        self.log_memory_usage("After clean denoising")
+        
+        # 第三步：初始化可学习的扰动delta
+        # 扰动的shape与main_latents相同: (1, 4096, 16)
         delta_perturbation = torch.zeros_like(clean_main_latents, requires_grad=True, device=str(self.device), dtype=torch.bfloat16)
         
         # 初始化为小的随机扰动
@@ -484,27 +581,29 @@ class DirectLatentsAdversarialGenerator:
             'comparison': 'denoised_latents_mse'
         }
         
-        logger.info(f"Starting PGD attack: {num_iterations} iterations, epsilon={epsilon}, alpha={alpha}")
+        logger.info(f"Delta epsilon: {epsilon}, alpha: {alpha}")
         
         consecutive_failures = 0
         max_consecutive_failures = 5
         
         for i in range(num_iterations):
+            self.log_memory_usage(f"Iteration {i+1} start")
+            
             delta_perturbation.requires_grad_(True)
             
-            # 在主要latents上加扰动
+            # 第四步：在主要latents上加扰动
             adversarial_main_latents = clean_main_latents + delta_perturbation
             
             # 计算扰动幅度
             perturbation_norm = delta_perturbation.norm().item()
             attack_info['perturbation_norms'].append(perturbation_norm)
             
-            # 使用扰动后的latents进行去噪
+            # 第五步：使用扰动后的latents进行去噪
             adversarial_denoised_latents = self.denoise_latents_with_perturbation(
                 adversarial_main_latents, subject_condition_latents, pipeline_components, enable_grad=True
             )
             
-            # 计算MSE损失
+            # 第六步：计算MSE损失
             mse_loss = F.mse_loss(clean_denoised_latents, adversarial_denoised_latents)
             
             if not mse_loss.requires_grad:
@@ -512,29 +611,29 @@ class DirectLatentsAdversarialGenerator:
                 consecutive_failures += 1
                 
                 if consecutive_failures >= max_consecutive_failures:
-                    logger.error(f"Too many consecutive gradient failures, stopping attack")
+                    logger.error(f"Too many consecutive gradient failures ({consecutive_failures}), stopping attack")
                     break
                 
                 torch.cuda.empty_cache()
                 continue
             
-            consecutive_failures = 0
+            consecutive_failures = 0  # 重置失败计数
             
-            # 正则化项
+            # 正则化项（L2范数约束）
             reg_loss = delta_perturbation.norm()
             
-            # 总损失（最大化MSE，最小化正则化）
+            # 第七步：总损失（最大化MSE，最小化正则化）
             total_loss = -mse_loss + lambda_reg * reg_loss
             
             # 记录
             attack_info['loss_history'].append(total_loss.item())
             attack_info['mse_history'].append(mse_loss.item())
             
-            if (i + 1) % 10 == 0:
-                logger.info(f"Iter {i+1}/{num_iterations}: MSE={mse_loss.item():.6f}, "
-                           f"Reg={reg_loss.item():.6f}, Delta_norm={perturbation_norm:.6f}")
+            logger.info(f"Iter {i+1}/{num_iterations}: MSE={mse_loss.item():.6f}, "
+                       f"Reg={reg_loss.item():.6f}, Total={total_loss.item():.6f}, "
+                       f"Delta_norm={perturbation_norm:.6f}")
             
-            # 反向传播和梯度更新
+            # 第八步：反向传播和梯度更新
             total_loss.backward()
             
             if delta_perturbation.grad is None:
@@ -543,13 +642,10 @@ class DirectLatentsAdversarialGenerator:
                 break
             
             # 梯度诊断
+            grad_diagnosis = self.diagnose_gradient_flow(delta_perturbation, "delta_perturbation")
             grad_norm = delta_perturbation.grad.norm().item()
             attack_info['gradient_norms'].append(grad_norm)
-            
-            if grad_norm < 1e-8:
-                attack_info['gradient_status'].append('Poor')
-            else:
-                attack_info['gradient_status'].append('OK')
+            attack_info['gradient_status'].append('OK' if grad_diagnosis else 'Poor')
             
             # 自适应步长调整
             if grad_norm < 1e-8:
@@ -580,8 +676,10 @@ class DirectLatentsAdversarialGenerator:
             # 内存清理
             if i % 5 == 0:
                 torch.cuda.empty_cache()
+                self.log_memory_usage(f"Iteration {i+1} after cleanup")
         
-        logger.info("PGD attack completed!")
+        logger.info("DIRECT-LATENTS PGD attack completed!")
+        logger.info(f"Final gradient status: {attack_info['gradient_status'][-5:] if attack_info['gradient_status'] else 'No gradients'}")
         logger.info(f"Final perturbation norm: {delta_perturbation.norm().item():.6f}")
         
         return delta_perturbation.detach(), attack_info
@@ -591,14 +689,34 @@ class DirectLatentsAdversarialGenerator:
         if len(tensor.shape) == 4:
             tensor = tensor.squeeze(0)
         
-        tensor = tensor.unsqueeze(0)
+        tensor = tensor.unsqueeze(0)  # 添加batch维度
         image = self.pipe.image_processor.postprocess(tensor, output_type="pil")[0]
         return image
     
+    def _test_basic_gradients(self):
+        """测试基础梯度功能"""
+        
+        try:
+            test_tensor = torch.randn(1, 4096, 16, device=str(self.device), requires_grad=True)  # main latents shape
+            result = test_tensor * 2 + 1
+            loss = result.mean()
+            loss.backward()
+            
+            if test_tensor.grad is not None:
+                grad_norm = test_tensor.grad.norm().item()
+                logger.info(f"✓ Basic gradient test passed, grad norm: {grad_norm:.6f}")
+                return True
+            else:
+                logger.error("✗ Basic gradient test failed")
+                return False
+        except Exception as e:
+            logger.error(f"✗ Basic gradient test failed: {e}")
+            return False
+    
     def process_dataset(self, 
                        dataset,
-                       epsilon: float = 0.1,
-                       alpha: float = 0.02,
+                       epsilon: float = 0.1,  # latent space epsilon
+                       alpha: float = 0.02,   # latent space alpha
                        num_iterations: int = 50,
                        lambda_reg: float = 0.1,
                        save_frequency: int = 100,
@@ -614,10 +732,10 @@ class DirectLatentsAdversarialGenerator:
         total_mse_improvement = 0.0
         results_log = []
         
-        logger.info(f"Starting adversarial generation for {total_samples} images")
-        logger.info(f"Parameters: epsilon={epsilon}, alpha={alpha}, iterations={num_iterations}")
+        logger.info(f"Starting DIRECT-LATENTS adversarial generation for {total_samples} images")
+        logger.info(f"Parameters: epsilon={epsilon}, alpha={alpha}")
         
-        with tqdm(dataloader, desc="Processing") as pbar:
+        with tqdm(dataloader, desc="Processing (DIRECT-LATENTS)") as pbar:
             for batch_idx, batch in enumerate(pbar):
                 if batch_idx < start_idx:
                     continue
@@ -631,6 +749,8 @@ class DirectLatentsAdversarialGenerator:
                     if original_image.size[0] < 256 or original_image.size[1] < 256:
                         logger.warning(f"Skipping small image {image_path}")
                         continue
+                    
+                    self.log_memory_usage(f"Processing image {batch_idx+1}")
                     
                     # 执行直接latents PGD攻击
                     delta_perturbation, attack_info = self.pgd_attack_direct_latents(
@@ -703,25 +823,28 @@ class DirectLatentsAdversarialGenerator:
                         'Avg_MSE': f"{total_mse_improvement/(batch_idx+1):.4f}",
                         'Current_MSE': f"{final_mse:.4f}",
                         'Delta_norm': f"{final_perturbation_norm:.4f}",
-                        'Grad_Success': f"{gradient_success_rate:.1%}"
+                        'Grad_Success': f"{gradient_success_rate:.1%}",
+                        'Method': 'DIRECT-LATENTS'
                     })
                     
                     # 定期保存
                     if (batch_idx + 1) % save_frequency == 0:
-                        log_path = self.logs_dir / f"progress_{batch_idx + 1}.json"
+                        log_path = self.logs_dir / f"direct_latents_progress_{batch_idx + 1}.json"
                         with open(log_path, 'w') as f:
                             json.dump(results_log, f, indent=2)
                 
                 except Exception as e:
                     logger.error(f"Failed to process image {batch_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
                 
-                # 内存清理
+                # 更频繁的内存清理
                 if batch_idx % 2 == 0:
                     torch.cuda.empty_cache()
         
         # 保存最终结果
-        final_log_path = self.logs_dir / "final_results.json"
+        final_log_path = self.logs_dir / "direct_latents_final_results.json"
         
         # 计算梯度统计
         total_gradient_checks = sum(len(r.get('attack_info', {}).get('gradient_status', [])) for r in results_log)
@@ -740,8 +863,15 @@ class DirectLatentsAdversarialGenerator:
             },
             'method_info': {
                 'method': 'DIRECT_LATENTS_ATTACK',
-                'attack_target': 'main_latents_shape_(1,4096,64)',
+                'attack_target': 'main_latents_shape_(1,4096,16)',
                 'mse_comparison': 'denoised_latents_space',
+                'advantages': [
+                    'Direct perturbation on main latents',
+                    'Stable gradient flow',
+                    'Precise control over perturbation magnitude',
+                    'Follows EasyControl pipeline exactly',
+                    'Subject conditions remain fixed'
+                ],
                 'parameters': {
                     'epsilon': epsilon,
                     'alpha': alpha,
@@ -756,7 +886,7 @@ class DirectLatentsAdversarialGenerator:
         with open(final_log_path, 'w') as f:
             json.dump(summary, f, indent=2)
         
-        logger.info(f"Generation completed!")
+        logger.info(f"DIRECT-LATENTS generation completed!")
         logger.info(f"Success rate: {success_count}/{total_samples} ({success_count/total_samples*100:.1f}%)")
         logger.info(f"Gradient success rate: {gradient_success_rate:.1%}")
         logger.info(f"Average MSE: {total_mse_improvement/max(success_count, 1):.4f}")
@@ -806,12 +936,13 @@ def main():
     # 额外的内存优化设置
     if torch.cuda.is_available():
         torch.backends.cuda.max_split_size_mb = 512
+        logger.info("Set CUDA max split size to 512MB")
     
     # 创建数据集
     logger.info(f"Loading dataset from {args.data_root}")
     dataset = LAIONFaceDataset(args.data_root, args.subset_size)
     
-    # 创建生成器
+    # 使用直接latents攻击生成器
     generator = DirectLatentsAdversarialGenerator(
         base_path=args.base_model,
         subject_lora_path=args.subject_lora,
@@ -820,7 +951,6 @@ def main():
     )
     
     # 开始处理
-    logger.info("Starting adversarial generation")
     logger.info(f"Parameters: epsilon={args.epsilon}, alpha={args.alpha}, iterations={args.num_iterations}")
     
     generator.process_dataset(
@@ -833,7 +963,7 @@ def main():
         resume_from=args.resume_from
     )
     
-    logger.info("Generation completed!")
+    logger.info("DIRECT-LATENTS generation completed!")
  
 if __name__ == "__main__":
     main()
@@ -847,11 +977,10 @@ if __name__ == "__main__":
 3. 在denoised_latents比较MSE
 4. 梯度更新delta噪声
 
-## 细节：
+## 核心优势：
 - 直接在packed latents (1, 4096, 16)上加扰动
 - 完全按照pipeline.py的prepare_latents逻辑
-- 精确控制扰动幅度（L∞约束）
-- subject条件保持固定不变
+- Subject条件保持固定不变
 
 ## 使用命令：
 python direct_latents_adversarial_generator.py \
@@ -864,4 +993,5 @@ python direct_latents_adversarial_generator.py \
     --subset_size 1 \
     --device cuda
 
+预期：更稳定的梯度，更直接的攻击效果
 """
