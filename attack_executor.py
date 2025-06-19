@@ -72,9 +72,9 @@ class MinimalAttackExecutor:
             )
             
             # 生成结果
-            clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components = self.generator.compute_clean_path(image)
+            clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components, clean_image_tensor = self.generator.compute_clean_path(image)
             clean_generated, adversarial_generated, noisy_original = self.generator.generate_final_results(
-                image, delta, clean_final_latents, clean_main_latents, pipeline_components
+                delta, clean_final_latents, clean_main_latents, pipeline_components, clean_image_tensor
             )
             
             # 计算最终指标

@@ -81,7 +81,14 @@ class ImageSpaceAdversarialGenerator:
         self.pipe.to(self.device)
         
         set_single_lora(self.pipe.transformer, subject_lora_path, lora_weights=[1], cond_size=512)
+        def disable_dropout_recursive(module):
+            for name, child in module.named_modules():
+                if isinstance(child, torch.nn.Dropout):
+                    child.p = 0.0  # 强制设置dropout概率为0
+                    print(f"Disabled dropout in: {name}")
         
+        print("正在禁用transformer中的dropout...")
+        disable_dropout_recursive(self.pipe.transformer)
         # ✅ 要求: VAE和transformer都切换到eval()，但保持梯度传播
         self.pipe.vae.eval()
         self.pipe.transformer.eval()
@@ -295,7 +302,7 @@ class ImageSpaceAdversarialGenerator:
             
             pipeline_components = (prompt_embeds, pooled_prompt_embeds, text_ids, latent_image_ids)
             
-            return clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components
+            return clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components, clean_image_tensor
     
     def pgd_attack(self, original_image: Image.Image, epsilon: float = 0.03, alpha: float = 0.01,
                   num_iterations: int = 50, lambda_reg: float = 0.1) -> Tuple[torch.Tensor, Dict]:
@@ -306,11 +313,10 @@ class ImageSpaceAdversarialGenerator:
         """
         
         # Phase 1: 计算clean路径（无梯度）
-        clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components = self.compute_clean_path(original_image)
+        clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components, clean_image_tensor = self.compute_clean_path(original_image)
         prompt_embeds, pooled_prompt_embeds, text_ids, latent_image_ids = pipeline_components
         
         # Phase 2: 初始化delta在图像空间 [512,512,3]
-        clean_image_tensor = self.pil_to_tensor_512(original_image)
         delta = torch.zeros_like(clean_image_tensor, requires_grad=True, device=self.device, dtype=torch.float32)
         
         with torch.no_grad():
@@ -395,9 +401,9 @@ class ImageSpaceAdversarialGenerator:
         
         return delta.detach(), attack_info
     
-    def generate_final_results(self, original_image: Image.Image, delta: torch.Tensor,
+    def generate_final_results(self, delta: torch.Tensor,
                              clean_final_latents: torch.Tensor, clean_main_latents: torch.Tensor,
-                             pipeline_components: Tuple) -> Tuple[Image.Image, Image.Image, Image.Image]:
+                             pipeline_components: Tuple, clean_image_tensor: torch.Tensor) -> Tuple[Image.Image, Image.Image, Image.Image]:
         """
         ✅ 要求5: 两个final_latents一个clean一个加噪，通过unpack和VAE decode生成出两个不一样的图片结果
         ✅ 要求5: 用最终的delta得到最初的加噪图片
@@ -406,7 +412,6 @@ class ImageSpaceAdversarialGenerator:
         prompt_embeds, pooled_prompt_embeds, text_ids, latent_image_ids = pipeline_components
         
         # 计算adversarial路径
-        clean_image_tensor = self.pil_to_tensor_512(original_image)
         final_noisy_image_tensor = clean_image_tensor + delta
         final_noisy_image_tensor = torch.clamp(final_noisy_image_tensor, 0, 1)
         
@@ -475,11 +480,11 @@ def process_single_image(generator: ImageSpaceAdversarialGenerator,
         )
         
         # 重新计算clean路径（只计算一次用于最终结果）
-        clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components = generator.compute_clean_path(image)
+        clean_final_latents, clean_main_latents, clean_subject_packed, pipeline_components, clean_image_tensor = generator.compute_clean_path(image)
         
         # 生成最终三种结果
         clean_generated, adversarial_generated, noisy_original = generator.generate_final_results(
-            image, delta, clean_final_latents, clean_main_latents, pipeline_components
+            image, delta, clean_final_latents, clean_main_latents, pipeline_components, clean_image_tensor
         )
         
         # 计算最终指标
