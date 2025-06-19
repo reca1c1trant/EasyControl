@@ -317,7 +317,7 @@ class DirectLatentsAdversarialGenerator:
                 'latent_image_ids': latent_image_ids,
                 'height': height,
                 'width': width,
-                'num_inference_steps': 5,
+                'num_inference_steps': 5, # 这里设置为5了
                 'guidance_scale': 3.5
             }
             
@@ -851,7 +851,7 @@ if __name__ == "__main__":
 - 直接在packed latents (1, 4096, 16)上加扰动
 - 完全按照pipeline.py的prepare_latents逻辑
 - 精确控制扰动幅度（L∞约束）
-- ubject条件保持固定不变
+- subject条件保持固定不变
 
 ## 使用命令：
 python direct_latents_adversarial_generator.py \
